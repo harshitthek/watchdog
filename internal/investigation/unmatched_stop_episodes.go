@@ -16,6 +16,10 @@ const (
 	kindUnmatchedStopStaticContexts resourceKind = "unmatched_stop_static_contexts"
 )
 
+// The link name also matches the resource kind registered by the static
+// version endpoint (#249).
+const stopStaticVersionLink = "gtfs_static_version"
+
 // unmatchedStopEpisodeIncludable uses the kinds the agency, server and reported-stop endpoints register.
 var unmatchedStopEpisodeIncludable = map[string]resourceKind{
 	"reported_stop":    "reported_stop",
@@ -56,9 +60,13 @@ type unmatchedStopEpisodesBody struct {
 	Included included               `json:"included,omitzero"`
 }
 
+func unmatchedStopEpisodePath(id int64) string {
+	return "/v1/unmatched-stop-episodes/" + strconv.FormatInt(id, 10)
+}
+
 // unmatchedStopEpisodeLinks builds an episode's links; closing_response only exists once it closed.
 func unmatchedStopEpisodeLinks(row dbgen.UnmatchedStopEpisodeView) itemLinks {
-	self := "/v1/unmatched-stop-episodes/" + strconv.FormatInt(row.UnmatchedStopEpisodeID, 10)
+	self := unmatchedStopEpisodePath(row.UnmatchedStopEpisodeID)
 	l := itemLinks{
 		"self": {URL: self},
 		"reported_stop": {
@@ -95,6 +103,150 @@ func unmatchedStopEpisodeLinks(row dbgen.UnmatchedStopEpisodeView) itemLinks {
 		}
 	}
 	return l
+}
+
+// stopStaticContext records what the static GTFS said about the stop during
+// part of the episode.
+type stopStaticContext struct {
+	StopMetadataVersionID int64    `json:"stop_metadata_version_id"`
+	Source                string   `json:"source"`
+	StaticStopFound       bool     `json:"static_stop_found"`
+	StopName              *string  `json:"stop_name"`
+	Latitude              *float64 `json:"latitude"`
+	Longitude             *float64 `json:"longitude"`
+	ParentStationID       *string  `json:"parent_station_id"`
+	LocationType          *int16   `json:"location_type"`
+	AppliesFrom           apiTime  `json:"applies_from"`
+	AppliesUntil          *apiTime `json:"applies_until"`
+	Links                 links    `json:"links"`
+}
+
+type stopStaticContextsBody struct {
+	Items    []stopStaticContext `json:"items"`
+	Links    links               `json:"links"`
+	Included included            `json:"included,omitzero"`
+}
+
+type stopStaticContexts struct {
+	body      stopStaticContextsBody
+	itemLinks []itemLinks
+	closedAt  *time.Time
+}
+
+func queryStopStaticContexts(ctx context.Context, q *dbgen.Queries, ids []int64, includeVersions bool) (map[int64]*stopStaticContexts, error) {
+	rows, err := q.ListUnmatchedStopEpisodeStaticContexts(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	return stopStaticContextsByEpisode(rows, includeVersions), nil
+}
+
+// stopStaticContextsByEpisode receives rows in publication order per episode.
+// A row without metadata still represents an existing episode.
+func stopStaticContextsByEpisode(rows []dbgen.ListUnmatchedStopEpisodeStaticContextsRow, includeVersions bool) map[int64]*stopStaticContexts {
+	byEpisode := make(map[int64]*stopStaticContexts)
+	for _, row := range rows {
+		collection := byEpisode[row.UnmatchedStopEpisodeID]
+		if collection == nil {
+			episodePath := unmatchedStopEpisodePath(row.UnmatchedStopEpisodeID)
+			collection = &stopStaticContexts{
+				body: stopStaticContextsBody{
+					Items: []stopStaticContext{},
+					Links: links{"self": episodePath + "/static-contexts", "episode": episodePath},
+				},
+				closedAt: row.ClosedAt,
+			}
+			byEpisode[row.UnmatchedStopEpisodeID] = collection
+		}
+		if row.StopMetadataVersionID == nil {
+			continue
+		}
+
+		// The metadata link and version foreign keys guarantee that the version
+		// columns are present whenever the metadata ID is present.
+		start := row.OpenedAt
+		if row.PublishedAt.After(start) {
+			start = *row.PublishedAt
+		}
+		items := collection.body.Items
+		if len(items) > 0 {
+			items[len(items)-1].AppliesUntil = newOptionalAPITime(&start)
+		}
+		versionID := *row.GtfsStaticVersionID
+		versionURL := "/v1/gtfs-static-versions/" + strconv.FormatInt(versionID, 10)
+		if includeVersions {
+			collection.itemLinks = append(collection.itemLinks, itemLinks{stopStaticVersionLink: {
+				Kind: stopStaticVersionLink,
+				ID:   versionID,
+				URL:  versionURL,
+			}})
+		}
+		collection.body.Items = append(items, stopStaticContext{
+			StopMetadataVersionID: *row.StopMetadataVersionID,
+			Source:                "watchdog_static_gtfs",
+			StaticStopFound:       *row.StaticStopFound,
+			StopName:              row.StopName,
+			Latitude:              row.Latitude,
+			Longitude:             row.Longitude,
+			ParentStationID:       row.ParentStationID,
+			LocationType:          row.LocationType,
+			AppliesFrom:           newAPITime(start),
+			AppliesUntil:          newOptionalAPITime(row.ClosedAt),
+			Links:                 links{stopStaticVersionLink: versionURL},
+		})
+	}
+	return byEpisode
+}
+
+func loadStopStaticContexts(ctx context.Context, q *dbgen.Queries, ids []int64) (map[int64]any, error) {
+	collections, err := queryStopStaticContexts(ctx, q, ids, false)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int64]any, len(collections))
+	for id, collection := range collections {
+		out[id] = collection.body
+	}
+	return out, nil
+}
+
+// listUnmatchedStopEpisodeStaticContexts serves an episode's static GTFS history.
+func (s *InvestigationService) listUnmatchedStopEpisodeStaticContexts(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	id, ok := pathID(ps, "episode_id")
+	if !ok {
+		s.fail(w, r, pgx.ErrNoRows)
+		return
+	}
+	var bad invalidParams
+	values := parseQuery(r, &bad, "include")
+	inc := s.parseInclude(values, map[string]resourceKind{stopStaticVersionLink: stopStaticVersionLink}, &bad)
+	if len(bad) > 0 {
+		writeInvalidParams(w, bad)
+		return
+	}
+
+	var collection *stopStaticContexts
+	err := s.read(r.Context(), func(ctx context.Context, q *dbgen.Queries) error {
+		collections, err := queryStopStaticContexts(ctx, q, []int64{id}, inc.has(stopStaticVersionLink))
+		if err != nil {
+			return err
+		}
+		collection = collections[id]
+		if collection == nil {
+			return pgx.ErrNoRows
+		}
+		collection.body.Included, err = s.loadIncluded(ctx, q, collection.itemLinks, inc)
+		return err
+	})
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	cache := cacheShort()
+	if collection.closedAt != nil {
+		cache = cacheImmutable(*collection.closedAt)
+	}
+	s.writeJSON(w, r, collection.body, cache)
 }
 
 // unmatchedStopEpisodeRepresentation maps one view row to its E14 and E15 representation.

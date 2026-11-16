@@ -1,9 +1,11 @@
 package investigation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/julienschmidt/httprouter"
 	"watchdog.onebusaway.org/internal/db/dbgen"
@@ -23,7 +26,7 @@ var episodesNow = time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
 // fakeLoaders counts loader calls per kind.
 type fakeLoaders map[resourceKind]int
 
-// newEpisodesRouter mounts E14 and E15 at episodesNow with a fake loader for each kind.
+// newEpisodesRouter mounts the stop episode routes at episodesNow with optional fake loaders.
 func newEpisodesRouter(t *testing.T, pool *pgxpool.Pool, kinds ...resourceKind) (http.Handler, fakeLoaders) {
 	t.Helper()
 	s, _ := newTestService(t)
@@ -45,6 +48,8 @@ func newEpisodesRouter(t *testing.T, pool *pgxpool.Pool, kinds ...resourceKind) 
 	router.HEAD("/v1/unmatched-stop-episodes", s.listUnmatchedStopEpisodes)
 	router.GET("/v1/unmatched-stop-episodes/:episode_id", s.getUnmatchedStopEpisode)
 	router.HEAD("/v1/unmatched-stop-episodes/:episode_id", s.getUnmatchedStopEpisode)
+	router.GET("/v1/unmatched-stop-episodes/:episode_id/static-contexts", s.listUnmatchedStopEpisodeStaticContexts)
+	router.HEAD("/v1/unmatched-stop-episodes/:episode_id/static-contexts", s.listUnmatchedStopEpisodeStaticContexts)
 	return router, calls
 }
 
@@ -116,12 +121,12 @@ func (s stop) episode(t *testing.T, opened, closed time.Time) int64 {
 }
 
 // linkStatic links episodeID to a static context published at published that did or did not find the stop.
-func (s stop) linkStatic(t *testing.T, episodeID int64, published time.Time, found bool) {
+func (s stop) linkStatic(t *testing.T, episodeID int64, published time.Time, found bool) (metadataID, versionID int64) {
 	t.Helper()
-	versionID := dbtest.ID(t, s.pool,
+	versionID = dbtest.ID(t, s.pool,
 		"INSERT INTO gtfs_static_version (server_id, published_at) VALUES ($1, $2) RETURNING gtfs_static_version_id",
 		s.serverID, published)
-	metadataID := dbtest.ID(t, s.pool,
+	metadataID = dbtest.ID(t, s.pool,
 		`INSERT INTO stop_metadata_version (gtfs_static_version_id, agency_id, reported_stop_id, static_stop_found)
 		 VALUES ($1, $2, $3, $4) RETURNING stop_metadata_version_id`,
 		versionID, s.agencyID, s.reportedStopID, found)
@@ -131,6 +136,7 @@ func (s stop) linkStatic(t *testing.T, episodeID int64, published time.Time, fou
 		episodeID, metadataID, s.reportedStopID, s.agencyID); err != nil {
 		t.Fatalf("link static context: %v", err)
 	}
+	return metadataID, versionID
 }
 
 func episodePath(id int64) string {
@@ -196,7 +202,11 @@ func wantEpisodeHead(t *testing.T, router http.Handler, path string) {
 
 func TestUnmatchedStopEpisodes_Registered(t *testing.T) {
 	_, router := newTestService(t)
-	for _, path := range []string{"/v1/unmatched-stop-episodes", "/v1/unmatched-stop-episodes/1"} {
+	for _, path := range []string{
+		"/v1/unmatched-stop-episodes",
+		"/v1/unmatched-stop-episodes/1",
+		"/v1/unmatched-stop-episodes/1/static-contexts",
+	} {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			if h, _, _ := router.Lookup(method, path); h == nil {
 				t.Errorf("%s %s is not registered", method, path)
@@ -621,4 +631,253 @@ func TestListUnmatchedStopEpisodes_IncludeStaticContexts(t *testing.T) {
 func TestListUnmatchedStopEpisodes_BadCloseReason(t *testing.T) {
 	router, _ := newEpisodesRouter(t, nil)
 	wantInvalidParam(t, doGet(t, router, episodesPath+"?close_reason=matched", nil), "close_reason")
+}
+
+func TestListUnmatchedStopEpisodeStaticContexts_RejectsUnknownParameter(t *testing.T) {
+	router, _ := newEpisodesRouter(t, nil)
+	wantInvalidParam(t, doGet(t, router, episodePath(1)+"/static-contexts?foo=1", nil), "foo")
+}
+
+func TestListUnmatchedStopEpisodeStaticContexts_RejectsInvalidRequest(t *testing.T) {
+	router, _ := newEpisodesRouter(t, nil)
+	path := episodePath(1) + "/static-contexts"
+	wantInvalidParam(t, doGet(t, router, path+"?include=gtfs_static_version", nil), "include")
+	withVersion, _ := newEpisodesRouter(t, nil, "gtfs_static_version")
+	wantInvalidParam(t, doGet(t, withVersion, path+"?include=gtfs_static_version&include=gtfs_static_version", nil), "include")
+	for _, id := range []string{"0", "-1", "abc"} {
+		wantNotFound(t, doGet(t, router, episodesPath+"/"+id+"/static-contexts", nil))
+	}
+}
+
+func TestStopStaticContextsRoute_UsesInvestigationPipeline(t *testing.T) {
+	_, router := newTestService(t)
+	path := episodePath(1) + "/static-contexts"
+	wantStatus(t, doGet(t, router, path, nil), http.StatusUnauthorized)
+	post := httptest.NewRecorder()
+	router.ServeHTTP(post, httptest.NewRequest(http.MethodPost, path, nil))
+	wantStatus(t, post, http.StatusMethodNotAllowed)
+}
+
+func TestListUnmatchedStopEpisodeStaticContexts_AppliesRule(t *testing.T) {
+	pool := dbtest.NewMigratedPool(t)
+	stop := newStop(t, pool)
+	opened := episodesNow.Add(-3 * time.Hour)
+	updated := opened.Add(time.Hour)
+	closed := updated.Add(time.Hour)
+	id := stop.episode(t, opened, closed)
+	// Insert the older publication second, then tie the newer publication.
+	newMetadata, newVersion := stop.linkStatic(t, id, updated, true)
+	oldMetadata, oldVersion := stop.linkStatic(t, id, opened.Add(-time.Hour), false)
+	tiedMetadata, tiedVersion := stop.linkStatic(t, id, updated, false)
+	if err := dbtest.Exec(pool, `UPDATE stop_metadata_version
+		SET stop_name = 'Instrument Stop', latitude = 0, longitude = 0,
+		    parent_station_id = 'station', location_type = 0
+		WHERE stop_metadata_version_id = $1`, newMetadata); err != nil {
+		t.Fatal(err)
+	}
+	router, _ := newEpisodesRouter(t, pool)
+	path := episodePath(id) + "/static-contexts"
+	rec := doGet(t, router, path, nil)
+	body := decodeEpisodeBody(t, rec)
+	versionLink := func(id int64) map[string]any {
+		return map[string]any{"gtfs_static_version": fmt.Sprintf("/v1/gtfs-static-versions/%d", id)}
+	}
+	want := map[string]any{
+		"links": map[string]any{"self": path, "episode": episodePath(id)},
+		"items": []any{
+			map[string]any{
+				"stop_metadata_version_id": float64(oldMetadata), "source": "watchdog_static_gtfs",
+				"static_stop_found": false, "stop_name": nil, "latitude": nil, "longitude": nil,
+				"parent_station_id": nil, "location_type": nil, "links": versionLink(oldVersion),
+				"applies_from": opened.Format(time.RFC3339Nano), "applies_until": updated.Format(time.RFC3339Nano),
+			},
+			map[string]any{
+				"stop_metadata_version_id": float64(newMetadata), "source": "watchdog_static_gtfs",
+				"static_stop_found": true, "stop_name": "Instrument Stop", "latitude": float64(0), "longitude": float64(0),
+				"parent_station_id": "station", "location_type": float64(0), "links": versionLink(newVersion),
+				"applies_from": updated.Format(time.RFC3339Nano), "applies_until": updated.Format(time.RFC3339Nano),
+			},
+			map[string]any{
+				"stop_metadata_version_id": float64(tiedMetadata), "source": "watchdog_static_gtfs",
+				"static_stop_found": false, "stop_name": nil, "latitude": nil, "longitude": nil,
+				"parent_station_id": nil, "location_type": nil, "links": versionLink(tiedVersion),
+				"applies_from": updated.Format(time.RFC3339Nano), "applies_until": closed.Format(time.RFC3339Nano),
+			},
+		},
+	}
+	if !reflect.DeepEqual(body, want) {
+		t.Errorf("body = %#v, want %#v", body, want)
+	}
+	if rec.Header().Get("Cache-Control") != "private, max-age=86400" ||
+		rec.Header().Get("Last-Modified") != closed.Format(http.TimeFormat) || rec.Header().Get("ETag") == "" {
+		t.Errorf("closed episode cache headers = %v", rec.Header())
+	}
+	wantStatus(t, doGet(t, router, path, map[string]string{"If-None-Match": rec.Header().Get("ETag")}), http.StatusNotModified)
+}
+
+func TestListUnmatchedStopEpisodeStaticContexts_Head(t *testing.T) {
+	pool := dbtest.NewMigratedPool(t)
+	s := newStop(t, pool)
+	opened := episodesNow.Add(-2 * time.Hour)
+	id := s.episode(t, opened, episodesNow.Add(-time.Hour))
+	s.linkStatic(t, id, opened, true)
+	router, _ := newEpisodesRouter(t, pool)
+	path := episodePath(id) + "/static-contexts"
+	rec := doGet(t, router, path, nil)
+	wantStatus(t, rec, http.StatusOK)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+	head, err := server.Client().Head(server.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer head.Body.Close()
+	data, err := io.ReadAll(head.Body)
+	if err != nil || len(data) != 0 || head.StatusCode != http.StatusOK {
+		t.Errorf("HEAD = %d, body %q, read error %v", head.StatusCode, data, err)
+	}
+	for _, header := range []string{"ETag", "Last-Modified", "Cache-Control", "Content-Type", "Content-Length"} {
+		if head.Header.Get(header) != rec.Header().Get(header) {
+			t.Errorf("HEAD %s = %q, GET = %q", header, head.Header.Get(header), rec.Header().Get(header))
+		}
+	}
+}
+
+func TestListUnmatchedStopEpisodeStaticContexts_NotFoundRow(t *testing.T) {
+	pool := dbtest.NewMigratedPool(t)
+	s := newStop(t, pool)
+	id := s.episode(t, episodesNow, time.Time{})
+	s.linkStatic(t, id, episodesNow, false)
+	router, _ := newEpisodesRouter(t, pool)
+	body := decodeEpisodeBody(t, doGet(t, router, episodePath(id)+"/static-contexts", nil))
+	items := body["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("got %d metadata rows, want 1", len(items))
+	}
+	item := items[0].(map[string]any)
+	if item["static_stop_found"] != false {
+		t.Errorf("static_stop_found = %v, want false", item["static_stop_found"])
+	}
+	for _, key := range []string{"stop_name", "latitude", "longitude", "parent_station_id", "location_type"} {
+		if value, ok := item[key]; !ok || value != nil {
+			t.Errorf("%s = %v, present = %t, want an explicit null", key, value, ok)
+		}
+	}
+}
+
+func TestListUnmatchedStopEpisodeStaticContexts_UnknownEpisode(t *testing.T) {
+	pool := dbtest.NewMigratedPool(t)
+	router, _ := newEpisodesRouter(t, pool)
+	wantNotFound(t, doGet(t, router, episodePath(1)+"/static-contexts", nil))
+}
+
+func TestListUnmatchedStopEpisodeStaticContexts_Empty(t *testing.T) {
+	pool := dbtest.NewMigratedPool(t)
+	stop := newStop(t, pool)
+	id := stop.episode(t, episodesNow, time.Time{})
+	router, _ := newEpisodesRouter(t, pool)
+	path := episodePath(id) + "/static-contexts"
+	rec := doGet(t, router, path, nil)
+	body := decodeEpisodeBody(t, rec)
+	if !reflect.DeepEqual(body["items"], []any{}) {
+		t.Errorf("empty items = %#v, want []", body["items"])
+	}
+	emptyETag := rec.Header().Get("ETag")
+
+	stop.linkStatic(t, id, episodesNow, true)
+	rec = doGet(t, router, path, map[string]string{"If-None-Match": emptyETag})
+	body = decodeEpisodeBody(t, rec)
+	if got := rec.Header().Get("ETag"); got == "" || got == emptyETag {
+		t.Errorf("ETag = %q after linking metadata, previous ETag = %q", got, emptyETag)
+	}
+	items := body["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("open episode returned %d items, want 1", len(items))
+	}
+	item := items[0].(map[string]any)
+	if until, exists := item["applies_until"]; !exists || until != nil {
+		t.Errorf("open applies_until = %v, present = %t", until, exists)
+	}
+	if rec.Header().Get("Cache-Control") != "private, max-age=30" || rec.Header().Get("Last-Modified") != "" {
+		t.Errorf("open episode cache headers = %v", rec.Header())
+	}
+}
+
+func TestListUnmatchedStopEpisodeStaticContexts_IncludeVersion(t *testing.T) {
+	pool := dbtest.NewMigratedPool(t)
+	stop := newStop(t, pool)
+	id := stop.episode(t, episodesNow, time.Time{})
+	_, first := stop.linkStatic(t, id, episodesNow, true)
+	_, second := stop.linkStatic(t, id, episodesNow.Add(time.Minute), false)
+	router, calls := newEpisodesRouter(t, pool, "gtfs_static_version")
+	path := episodePath(id) + "/static-contexts?include=gtfs_static_version"
+	body := decodeEpisodeBody(t, doGet(t, router, path, nil))
+	want := map[string]any{
+		fmt.Sprintf("/v1/gtfs-static-versions/%d", first): map[string]any{
+			"kind": "gtfs_static_version", "id": float64(first),
+		},
+		fmt.Sprintf("/v1/gtfs-static-versions/%d", second): map[string]any{
+			"kind": "gtfs_static_version", "id": float64(second),
+		},
+	}
+	if !reflect.DeepEqual(body["included"], want) || calls["gtfs_static_version"] != 1 {
+		t.Errorf("included = %#v, loader calls = %d", body["included"], calls["gtfs_static_version"])
+	}
+}
+
+type countedStaticQueries struct {
+	dbgen.DBTX
+	count int
+}
+
+func (db *countedStaticQueries) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	db.count++
+	return db.DBTX.Query(ctx, sql, args...)
+}
+
+func TestStopStaticContextsLoader(t *testing.T) {
+	pool := dbtest.NewMigratedPool(t)
+	stop := newStop(t, pool)
+	a := stop.episode(t, episodesNow.Add(-3*time.Hour), episodesNow.Add(-2*time.Hour))
+	b := stop.episode(t, episodesNow.Add(-90*time.Minute), episodesNow.Add(-time.Hour))
+	c := stop.episode(t, episodesNow.Add(-30*time.Minute), time.Time{})
+	stop.linkStatic(t, a, episodesNow.Add(-4*time.Hour), false)
+	stop.linkStatic(t, c, episodesNow.Add(-30*time.Minute), true)
+
+	service, _ := newTestService(t)
+	load := service.loaders[kindUnmatchedStopStaticContexts]
+	if load == nil {
+		t.Fatal("static context loader is not registered")
+	}
+	db := &countedStaticQueries{DBTX: pool}
+	included, err := load(context.Background(), dbgen.New(db), []int64{c, a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.count != 1 || len(included) != 3 {
+		t.Fatalf("loader executed %d queries and returned %d episodes, want 1 and 3", db.count, len(included))
+	}
+	router, _ := newEpisodesRouter(t, pool)
+	list := decodeEpisodeBody(t, doGet(t, router, episodesPath+"?include=static_contexts", nil))
+	nested := list["included"].(map[string]any)
+	for _, id := range []int64{a, b, c} {
+		path := episodePath(id) + "/static-contexts"
+		rec := doGet(t, router, path, nil)
+		wantStatus(t, rec, http.StatusOK)
+		got, err := encodeJSON(included[id])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, rec.Body.Bytes()) {
+			t.Errorf("loader %d = %s, GET = %s", id, got, rec.Body.Bytes())
+		}
+		var direct any
+		if err := json.Unmarshal(got, &direct); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nested[path], direct) {
+			t.Errorf("included %s = %#v, GET = %#v", path, nested[path], direct)
+		}
+	}
 }

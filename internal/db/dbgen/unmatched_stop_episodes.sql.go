@@ -42,6 +42,82 @@ func (q *Queries) GetUnmatchedStopEpisode(ctx context.Context, unmatchedStopEpis
 	return i, err
 }
 
+const listUnmatchedStopEpisodeStaticContexts = `-- name: ListUnmatchedStopEpisodeStaticContexts :many
+SELECT e.unmatched_stop_episode_id,
+       opening.observed_at AS opened_at,
+       closing.observed_at AS closed_at,
+       v.stop_metadata_version_id,
+       v.static_stop_found,
+       v.stop_name,
+       v.latitude,
+       v.longitude,
+       v.parent_station_id,
+       v.location_type,
+       g.gtfs_static_version_id,
+       g.published_at
+FROM unmatched_stop_episode e
+JOIN onebusaway_metrics_response_agency opening_agency
+    ON opening_agency.response_agency_id = e.first_response_agency_id
+JOIN onebusaway_metrics_response opening ON opening.response_id = opening_agency.response_id
+LEFT JOIN onebusaway_metrics_response_agency closing_agency
+    ON closing_agency.response_agency_id = e.closing_response_agency_id
+LEFT JOIN onebusaway_metrics_response closing ON closing.response_id = closing_agency.response_id
+LEFT JOIN unmatched_stop_episode_metadata m ON m.unmatched_stop_episode_id = e.unmatched_stop_episode_id
+LEFT JOIN stop_metadata_version v ON v.stop_metadata_version_id = m.stop_metadata_version_id
+LEFT JOIN gtfs_static_version g ON g.gtfs_static_version_id = v.gtfs_static_version_id
+WHERE e.unmatched_stop_episode_id = ANY($1::bigint[])
+ORDER BY e.unmatched_stop_episode_id, g.published_at, g.gtfs_static_version_id
+`
+
+type ListUnmatchedStopEpisodeStaticContextsRow struct {
+	UnmatchedStopEpisodeID int64
+	OpenedAt               time.Time
+	ClosedAt               *time.Time
+	StopMetadataVersionID  *int64
+	StaticStopFound        *bool
+	StopName               *string
+	Latitude               *float64
+	Longitude              *float64
+	ParentStationID        *string
+	LocationType           *int16
+	GtfsStaticVersionID    *int64
+	PublishedAt            *time.Time
+}
+
+// Preserve an episode row even if no static metadata has been linked.
+func (q *Queries) ListUnmatchedStopEpisodeStaticContexts(ctx context.Context, episodeIds []int64) ([]ListUnmatchedStopEpisodeStaticContextsRow, error) {
+	rows, err := q.db.Query(ctx, listUnmatchedStopEpisodeStaticContexts, episodeIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUnmatchedStopEpisodeStaticContextsRow
+	for rows.Next() {
+		var i ListUnmatchedStopEpisodeStaticContextsRow
+		if err := rows.Scan(
+			&i.UnmatchedStopEpisodeID,
+			&i.OpenedAt,
+			&i.ClosedAt,
+			&i.StopMetadataVersionID,
+			&i.StaticStopFound,
+			&i.StopName,
+			&i.Latitude,
+			&i.Longitude,
+			&i.ParentStationID,
+			&i.LocationType,
+			&i.GtfsStaticVersionID,
+			&i.PublishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnmatchedStopEpisodes = `-- name: ListUnmatchedStopEpisodes :many
 SELECT unmatched_stop_episode_id, reported_stop_id, agency_id, first_response_agency_id, closing_response_agency_id, last_reported_at, close_reason, server_id, opened_at, closed_at, opening_response_id, closing_response_id, stop_id, stop_metadata_version_id, static_found, gtfs_static_version_id, previous_episode_count, previous_closed_at
 FROM unmatched_stop_episode_view
